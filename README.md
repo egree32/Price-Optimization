@@ -1,0 +1,2 @@
+# Price-Optimization
+Pernalonga, a leading supermarket chain of over 400 stores in Lunitunia, sells over 10 thousand products in over 400 categories.  Pernalonga has two main levers to induce sales - shelf price and promoted price.  Product level shelf prices are increased to drive contribution and lowered to drive sales.  Pernalonga partners with suppliers to fund in-store temporary price reductions and derives about 30% of its sales on promotions.  
