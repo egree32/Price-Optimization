@@ -1,0 +1,259 @@
+---
+title: "Team 10 Codes - Product Affinity Substitute and Complement Calculation"
+output:
+  html_document:
+    df_print: paged
+editor_options: 
+  chunk_output_type: inline
+---
+
+The reason we seek for complement and substitute goods is because we need substitute and complement good is crucial to response funciton, we need them to better fit our price response function
+```{r}
+# Loading required packages
+library(arules)
+library(arulesViz)
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(knitr)
+library(lubridate)
+library(plyr)
+library(RColorBrewer)
+library(readxl)
+library(tidyverse)
+```
+
+Our first approach is to use basket analysis, the stores we target are derived form the results from another markdown file.
+```{r}
+dtProduct <- fread('DATA/product_table.csv')
+
+dtTransactionEng <- fread('DATA/transaction_table_engineered.csv')[, -1]
+dtTransactionEng <- merge(dtTransactionEng, dtProduct, by = 'prod_id')
+
+dtScope <- fread('DATA/scope.csv')
+list_store <- sort(unique(dtScope$store_id))
+# take store number 157 315 320 331 335 341 342 343 344 345 346 347 348 349 395 525 572 588 627 673 from Jenny's selection
+dtProduct <- dtScope[pre_target == 1]
+# the products labeled 1 are those targeted to perform price change
+
+dtBasket <- data.table(ddply(dtTransactionEng, c("tran_id", "store_id"), function(dt) paste(dt$prod_id, collapse = ",")))
+setkeyv(dtBasket, c('store_id', 'tran_id'))
+fWriteTrans <- function(id) {
+  filename <- paste0('DATA/basket_store_', id, '.csv')
+  fwrite(dtBasket[store_id == id, 3], file = filename, quote = FALSE, col.names = FALSE)
+}
+for (id in list_store) { fWriteTrans(id) }
+# write csv with respect to store
+
+fReadTrans <- function(id) {
+  filename <- paste('DATA/basket_store_', id, '.csv', sep = '')
+  read.transactions(file = filename, format = 'basket', sep = ',')
+}
+for (id in list_store) { assign(paste0('tr_', id), fReadTrans(id)) }
+# read transaction with respect to store
+```
+
+let's have a look at store No.342 first because it the store with most transacitons. 
+```{r}
+id <- 342
+var <- paste0('tr_', id)
+# summary(get(var))
+# If absolute it will plot numeric frequencies of each item independently. If relative it will plot how many times these items have appeared as compared to others.
+itemFrequencyPlot(get(var), topN = 20, type = "absolute", col = brewer.pal(8, 'Pastel2'), main = "Absolute Item Frequency Plot")
+itemFrequencyPlot(get(var), topN = 20, type = "relative", col = brewer.pal(8, 'Pastel2'), main = "Relative Item Frequency Plot")
+```
+The plot shows that apart from the top 2 selling items, all other items are pretty much evenly distributed, so the association rule is easier to stand.
+
+Next step is to mine the association rules using the APRIORI algorithm. The function apriori() is from package arules, and we set the mine rules with minimum support of 10/length(tr_342) (which means such event has happend for at least 10 times in the store), minimum confidence of 0.8, maximum of 5 items (maxlen), and a maximal time for subset checking of 5 seconds (maxtime).
+
+The reason we choose a maximum of 5 items is because too many variables will be harder for us to fit the response function later and we don't have enough observations
+
+For each store selected, we are limiting the rhs only to the target products, because we are searching for complementary goods for target products.
+```{r}
+list_product <- sort(dtProduct[store_id == id, prod_id])
+
+assign(paste0('assn.rules_', id, '_tgt.rhs'), apriori(get(var), parameter = list(supp = 10 / length(get(var)), conf = 0.8, maxlen = 5), appearance = list(rhs = list_product)))
+# assign(paste0('assn.rules_', id, '_tgt.lhs'), apriori(get(var), parameter = list(supp = 10 / length(get(var)), conf = 0.8, maxlen = 5), appearance = list(lhs = list_product)))
+
+# we can look at the the top 10 rows of association rules and their quality individually
+#inspect(assn.rules_342_tgt.rhs)[1:10,]
+#quality(assn.rules_342_tgt.rhs)[1:10,]
+```
+
+we can also sort by feature in quality and show the top results in the association rule. If the confidence is high enough given enough support, then according to economic definition they are complementary goods.
+```{r}
+inspect(head(assn.rules_342_tgt.rhs, n = 20, by = "count"))
+quality(assn.rules_342_tgt.rhs)[1:10, ]
+```
+
+We can save the output files as dataframe in .csv format for future use. (as we are working separately)
+```{r}
+fWriteAssnRulesSup <- function(id) {
+  var <- paste0('tr_', id)
+  dt <- dtScope[store_id == id]
+  lhs <- apriori(get(var), parameter = list(supp = 10 / length(get(var)), conf = 0.8, maxlen = 5), appearance = list(lhs = dt[dt$pre_target==1,prod_id]))
+  rhs <- apriori(get(var), parameter = list(supp = 10 / length(get(var)), conf = 0.8, maxlen = 5), appearance = list(rhs = dt[dt$pre_target==1,prod_id]))
+  if (length(lhs) > 0) {
+    fwrite(inspect(head(lhs, n = length(lhs), by = 'count')), paste0('assn.rules.sup_', id, '_tgt.lhs.csv'))
+  }
+  if (length(rhs) > 0) {
+    fwrite(inspect(head(rhs, n = length(rhs), by = 'count')), paste0('assn.rules.sup_', id, '_tgt.rhs.csv'))
+  }
+}
+# for (id in list_store) { fWriteAssnRulesSup(id) }
+```
+
+APRIORI is good at calculating complementary goods, because it is filtering out association rules based on confidence and support. If a combination happens frequently in transactions and the conditional probability of B given A (confidence) is high enough, we are confident to say that increase in demand for A increases demand for B, thus A and B are complementary goods. However, APRIORI cannot determine which goods are substitute goods as a low confidence doesn't necessarily mean that they are substitute goods: they are more likely independent from each other.
+
+Therefore, we calculate cross-elasticity across products and try to identify complements and substitutes
+```{r}
+dtScope <- fread('DATA/scope.csv')
+list_store <- sort(unique(dtScope$store_id))
+# take store number 157 315 320 331 335 341 342 343 344 345 346 347 348 349 395 525 572 588 627 673 from Jenny's selection
+
+dtProduct <- fread('DATA/product_table.csv')
+
+dtTransactionEng <- fread('DATA/transaction_table_engineered.csv')[, -1]
+dtTransactionEng <- dtTransactionEng[store_id %in% list_store,]
+dtTransactionEng <- merge(dtTransactionEng, dtProduct, by = 'prod_id')
+setkeyv(dtTransactionEng, c('store_id', 'tran_id', 'tran_dt'))
+```
+
+2016-01-02 and 2016-01-03 are treated as last week of 2015 (week 53), so these two transaction days are removed
+```{r}
+strftime(sort(unique(dtTransactionEng$tran_dt)), format = "%V") 
+dtTransactionEng <- dtTransactionEng[!tran_dt %in% c("2016-01-02", "2016-01-03"),]
+dtTransactionEng[, wk := (as.numeric(substr(tran_dt, 4, 4)) - 6) * 53 + as.numeric(strftime(tran_dt, format = "%V"))]
+```
+
+We are changing shelf price, so we need to know how shelf price (prod_unit_price) affects volume, all elasticity will be calculated based on shelf price.
+```{r}
+dtTransactionEng[, p := mean(prod_unit_price), by = c('prod_id', 'store_id', 'wk')]
+dtTransactionEng[, q := sum(tran_prod_sale_qty), by = c('prod_id', 'store_id', 'wk')]
+```
+
+The loop calculates delta in price and quantity, and remove those whose delta price = 0 as it makes no sense to calculate elasticity with zero change in price and we are unlikly to recommend a price change for them
+```{r}
+for (id in list_store) {
+  dt <- dtTransactionEng[store_id == id,]
+  dt <- dt[prod_id %in% dtScope[store_id == id, prod_id],]
+  dt <- unique(dt[, c('prod_id', 'store_id', 'wk', 'q', 'p')])
+  setkeyv(dt, c('prod_id', 'wk'))
+  dt[, count := nrow(prod_id), by = prod_id]
+  
+  # create lag variable to calculate delta in price and quantity
+  dt[, wk_lag := c(NA, wk[-.N]), by = prod_id]
+  dt[, p_lag := c(NA, p[-.N]), by = prod_id]
+  dt[, q_lag := c(NA, q[-.N]), by = prod_id]
+  
+  # calculate delta in price, quantity and week
+  dt[, d_wk := wk - wk_lag]
+  dt[, d_p := p - p_lag]
+  dt[, d_q := q - q_lag]
+  
+  # we remove rows in which d_p is 0 or NA as these rows provide with no result
+  assign(paste0('dtTrx_', id), dt[d_p != 0 & !is.na(d_p)])
+}
+```
+
+The functions, both old and new ones, calculate cross elasticity across products
+```{r}
+# the older model is slower and replaced with the newer funciton below
+fXED <- function(id) {
+  dt <- get(paste0('dtTrx_', id))
+  list_tgt <- dtScope[store_id == id & pre_target == 1, prod_id]
+  list_non.tgt <- dtScope[store_id == id & pre_target == 0, prod_id]
+  # Initialize
+  dtXED <- data.table(tgt = integer(0), non.tgt = integer(0), week = integer(0), xed = numeric(0)) 
+  # calculate elasticity, we expect the good A responds to price change in good B within the same week
+  for (tgt in list_tgt) {
+    for (week in dt[prod_id == tgt]$wk) {
+      delta_q <- dt[prod_id == tgt & wk == week, d_q]
+      quantity <- dt[prod_id == tgt & wk == week, q]
+      list_non.tgt_same.week <- dt[prod_id %in% list_non.tgt & wk == week & d_wk == 1, prod_id]
+      for (non.tgt in list_non.tgt_same.week) {
+        delta_p <- dt[prod_id == non.tgt & wk == week, d_p]
+        price <- dt[prod_id == non.tgt & wk == week, p]
+        xed <- (delta_q / delta_p) * (price / quantity)
+        dtXED <- rbind(dtXED, data.table(tgt, non.tgt, week, xed))
+      }
+    }
+  }
+  return(dtXED)
+}
+```
+
+```{r}
+# new version, the method is the same
+fXED <- function(id) {
+  dt <- get(paste0('dtTrx_', id))
+  list_tgt <- dtScope[store_id == id & pre_target == 1, prod_id]
+  list_non.tgt <- dtScope[store_id == id & pre_target == 0, prod_id]
+  dtXED <- data.table(target = integer(0), prod_id = integer(0), wk = integer(0), xed = numeric(0)) # initialize
+  # To calculate cross-elasticity of good A with price change in B we use the formula: PE = (ΔQ/ΔP) * (P/Q), in which Q is the quantity of good A and P is the price of good B
+  # We expect the good A responds to price change in good B within the same week
+  for (tgt in list_tgt) {
+    for (week in dt[prod_id == tgt]$wk) {
+      delta_q <- dt[prod_id == tgt & wk == week, d_q]
+      quantity <- dt[prod_id == tgt & wk == week, q]
+      if (length(delta_q) * length(quantity) > 0) {
+        dtN <- dt[prod_id %in% list_non.tgt & wk == week & d_wk == 1, c('prod_id', 'wk', 'd_p', 'p')]
+        dtN[, target := tgt]
+        dtN[, xed := (delta_q / d_p) * (p / quantity)]
+        dtN <- dtN[, c('target', 'prod_id', 'wk', 'xed')]
+        dtXED <- rbind(dtXED, dtN)
+      }
+    }
+  }
+  return(dtXED)
+}
+for (id in list_store) {
+  tmp <- fXED(id)
+  assign(paste0('dtXED_', id), tmp)
+  # fwrite(tmp, paste0('dtXED_', id, '.csv'))
+}
+```
+
+Let's take store No.342 for example again, for target product No. 999156311, the products that have highest cross-elasticity are 999745827 and 999383364 and the products that have lowest elasticity are 999530159 and 999958240
+```{r Cross Elasticity}
+dt <- fXED(342)
+dt <- rbind(dt[order(target, - xed),][, .SD[1:2], target], dt[order(target, xed),][, .SD[1:2], target])
+setkey(dt, target)
+dt
+```
+
+We write a function to recommend 2 suuplementary goods (2 highest in elasticity) and 2 substitute goods (2 lowest in elasticity) for each product in each store within provided target list 
+```{r}
+fCompSubList <- function(id) {
+  dt <- get(paste0('dtXED_', id))
+  table <- rbind(dt[order(target, - xed),][, .SD[1:2], target], dt[order(target, xed),][, .SD[1:2], target])
+  setkey(table, target)
+  dtList <- data.table(id = integer(), tgt = integer(), comp1 = integer(), comp2 = integer(), sub1 = integer(), sub2 = integer())
+  list_tgt <- dtScope[store_id == id & pre_target == 1, prod_id]
+  for (tgt in list_tgt) {
+    list <- table[target == tgt, prod_id]
+    new <- data.table(id, tgt, comp1 = list[1], comp2 = list[2], sub1 = list[3], sub2 = list[4])
+    dtList <- rbind(dtList, new)
+  }
+  return(dtList)
+}
+```
+
+Again, take store No.342 as example, for each target product we suggest complement 1 and 2 and subsittute 1 and 2 respectively, e.g. for product 999168670 in store 342 we also monitor the price of 999679560, 999794894, 999239196 and 999764855.
+```{r}
+fCompSubList(342)
+```
+
+```{r}
+dtList <- data.table(id = integer(), tgt = integer(), comp1 = integer(), comp2 = integer(), sub1 = integer(), sub2 = integer())
+for (id in list_store) {
+  tmp <- fCompSubList(id)
+  dtList <- rbind(dtList, tmp)
+}
+dtList
+```
+
+Write suggestion list for fitting the price response function
+```{r}
+fwrite(dtList, 'DATA/dtList.csv')
+```

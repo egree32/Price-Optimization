@@ -1,0 +1,389 @@
+---
+title: "Pricing Model - Pricing Part"
+Objective: To make price changes to the same 100 products across 2 categories (fresh
+  products excluded) in 10 stores in order to improve Pernalonga's expected revenue
+  while maintaining overall profitability.
+output: pdf_document
+Author: Team 10
+---
+
+**Notes:**
+**Some codes are run for sanity check and infomation. Some unnecessary codes of this type are deleted in this notebook for the purpose of simplicity.**
+
+# Load library and read dataset
+```{r}
+setwd("C:/Users/jczsh/Dropbox/Pernalonga")
+library(data.table)
+library(dummies)
+
+trans = fread("trans.csv", header = TRUE)
+
+# read data from the product table to which we added whether the category is a fresh one
+prod = fread("product_table_pooja.csv", header = TRUE)
+# head(prod)
+```
+
+
+***
+
+> Scope Down
+
+## Identify categories
+
+Firstly, we filter out 'fresh' categories (we do not delete the data but just mark the products as 'fresh' for they could act as complements and substitutes in the future);
+After that we compare the sales of different categories and decide to focus on the top 5 categories because they account for a big share of the sales and implenting price change on these products is likely to affect revenue to a large extent. This criterion still takes into account those products with lack of sales in the historical data but high potential growth in the future. 
+
+*This chunk below works to mark the potential products we will target to implement price change.*
+
+```{r}
+# examine category and products
+category_prod = prod[, list(prod_size = uniqueN(prod_id)), by = category_desc_eng]
+
+# sales (5 categories without fresh)
+trans = merge(trans, prod[, .(prod_id, category_desc_eng, subcategory_id, fresh_flag)], all.x = TRUE, by = "prod_id")
+category_sales = trans[fresh_flag == 0, list(sales = sum(tran_prod_sale_amt)), by = category_desc_eng] # identify non-fresh categories
+top_5_sales = merge(head(category_sales[order(-sales)], 5), category_prod, by = 'category_desc_eng')
+top_5_sales[order(-sales)]
+
+target_categories = top_5_sales$category_desc_eng
+# target_categories: will target products among these categories
+
+trans[category_desc_eng %in% target_categories, pre_target := 1] # pre_target means selecting products among these products
+trans[is.na(pre_target), pre_target := 0]
+```
+
+
+## Add weekly information
+
+It is very important to note that in the historical data, shelf price does not vary on a daily basis but more likely on a weekly basis (if we aggregate to month level, we will not have enough observations). Moreover, as there might not be enough demand for each products every day, daily noises in demand could potentially affect model performance. Weekly data can help alleviate the problem. Besides, daily pricing elasticity will not come in handy because this price change will be permanent until the next (unscheduled) shelf price change and short-term measures do not capture the long term effect of price change. It makes more sense to estimate weekly elasticity. Therefore, in the following analysis, we will build response functions and do calculations on a weekly basis. 
+
+*This chunk below works to obtain weekly information for further use.*
+
+```{r}
+week = data.table(unique(trans[, tran_dt]))
+colnames(week) <- 'tran_dt'
+week[, tran_wk := strftime(tran_dt, format = "%Y%V")]
+week = week[order(tran_dt)]
+week = week[3:dim(week)[1], ] # there are only two days ('2016-01-01' & '2016-01-02') in the last week of 2015, deleted
+week[, wk_index := as.integer(strftime(tran_dt, format = "%V"))]
+
+model_data = merge(trans, week, by = 'tran_dt')
+```
+
+## Remove combinations (store + product) without price variance 
+
+Secondly, we filter out the store_product combinations without price change on a weekly basis because we can neither compute their pricing elasticity nor use them as complements or substitutes. The price level of a product_store combination is calculated by dividing sum of the sales (tran_prod_sale_amt) and sum of total quantities sold (tran_prod_sale_qty) in that week. Instead of simply averaging the price of all the products, we also consider how many units are sold at each price as a weight in order to compute a reasonable price of a specific product in a store within a week. In addition, because we will need to put in the model 10+ attributes, it makes sense to delete the product_store combinations with only 10 weekly observations.
+
+*This chunck below works to delete the combinations without weekly price change in the data.*
+
+```{r}
+wkly_filter = model_data[, list(wkly_price = sum(tran_prod_sale_amt)/sum(tran_prod_sale_qty)), by = .(store_id, prod_id, tran_wk, wk_index)]
+wkly_std = wkly_filter[, list(price_std = sd(wkly_price)), by = .(store_id, prod_id)]
+
+# make sure the price of product actually changed 
+wkly_std = wkly_std[(!is.na(price_std)) & (price_std != 0)] # about 816692/2378963 = 34% combinations are left.
+
+# make sure each combination has over 10 observations
+wkly_obs = wkly_filter[, list(no_of_obs = .N), by = .(store_id, prod_id)]
+wkly_obs = wkly_obs[no_of_obs >= 10]
+
+# impose two constraints for each combination on the model data: 1) standard deviation != 0,  2) over 10 weekly observations 
+model_data = merge(model_data, wkly_obs[, .(store_id, prod_id)], by = c('store_id', 'prod_id'))
+model_data = merge(model_data, wkly_std[, .(store_id, prod_id)], by = c('store_id', 'prod_id'))
+
+dim(model_data) # 19,421,849
+
+dim(unique(model_data[, .(store_id, prod_id)]))[1] # all combinations: 333,764 
+dim(unique(model_data[pre_target == 1, .(store_id, prod_id)]))[1] # the combinations we will analyze: 20,953
+
+# pre_target
+length(unique(model_data[pre_target == 1, prod_id])) # 713 products
+length(unique(model_data[pre_target == 1, store_id])) # 409 stores
+```
+
+
+## Restrict stores
+
+Because we are asked to apply price changes in 20 stores, it will make life much easier if we search for the target combinations among 20 stores. These stores are chosen because they have more pre_target combinations in the data set, which makes it more likely for them to share more products (we need to change the price of the same 100 products across 10 stores).
+
+*This chunk below works to extract the data for 20 stores to analyze.*
+
+```{r}
+pre_target = model_data[pre_target == 1]
+wkly_pre_target = pre_target[, list(wkly_price = sum(tran_prod_sale_amt)/sum(tran_prod_sale_qty), wkly_volume = sum(tran_prod_sale_qty)), by = .(store_id, prod_id, tran_wk, wk_index)]
+wkly_pre_target = wkly_pre_target[order(store_id, prod_id, tran_wk, wk_index)]
+
+store_id_349_prod = unique(wkly_pre_target[store_id == 349, prod_id]) # 349 has most products
+
+head(wkly_pre_target[prod_id %in% store_id_349_prod, list(prod = uniqueN(prod_id)), by = store_id][order(-prod)], 20) 
+
+top_20_stores = head(wkly_pre_target[prod_id %in% store_id_349_prod, list(prod = uniqueN(prod_id)), by = store_id][order(-prod)], 20)$store_id 
+
+# only keep 20 stores
+model_data = model_data[store_id %in% top_20_stores]
+
+dim(model_data) # 3,308,843
+
+dim(unique(model_data[, .(store_id, prod_id)]))[1] # 42,900
+dim(unique(model_data[pre_target == 1, .(store_id, prod_id)]))[1] # 3,725
+
+# pre_target
+length(unique(model_data[pre_target == 1, prod_id])) # 553 products
+length(unique(model_data[pre_target == 1, store_id])) # 20 stores
+```
+
+### Therefore, 42,900 combinations are kept now for analysis, among which 3,725 combinations are candidates for price change involving 553 products and 20 stores.
+
+***
+
+> Modeling
+
+* As many of the product_store combination only have around 20 weekly observations. We should restrict the number of variables to make sure the regression model can run successfully. 
+
+* Logit response function is chosen for it generally predicts revenue and profits better compared to the other two (especially in extreme cases) and allows elasticity to vary with different prices.
+
+* Aspects to consider:
+  + Weekly price, we will vary this variable to get the best price which maximizes revenue. 
+  + Weekly discount, this is used as a control variable to control for promotions.
+  + Seasonality, we thought of three aspects to prevent or control the effects of seasonality. The first one is decomposition, but due to the fact that the quantities sold of a product may skip a few weeks and the data is not continuous in that regard, it could be hard to extract seasonality from the data. Secondly, after comfirming with professor Alvin, we decide to introduce weekly index to the model to capture seasonal trends. Thirdly, as holidays will have a big influence on demand, we account for this effect in the regressors.
+  + Product affinity, the price variation of complements and substitutes
+
+## Data Preparation
+
+### Variables
+
+*This chunk below works to integrate seasonality, calculate weekly measures (wkly_volume, wkly_price, wkly_dct) and store the data.*
+
+```{r}
+# holiday effects
+por_na_holidays = c('2016-01-01', '2016-03-25', '2016-04-25', '2016-05-26', '2016-06-10', '2016-08-15', '2016-10-05', '2016-11-01', '2016-12-01', '2016-12-08', '2016-12-25', '2017-01-01', '2017-04-14', '2017-04-16', '2017-04-25', '2017-05-01', '2017-06-10', '2017-06-15', '2017-08-15', '2017-10-05', '2017-11-01', '2017-12-01', '2017-12-08', '2017-12-25')
+model_data[tran_dt %in% por_na_holidays, tran_hol := 1]
+model_data[is.na(tran_hol), tran_hol := 0]
+
+model_data[, tran_wk_hol := max(tran_hol), by = tran_wk]
+hist(model_data[, list(obs = uniqueN(tran_wk)), by = .(store_id, prod_id)]$obs, main = 'Histogram of # of Weeks For Each Combination', xlab = 'Weeks', ylab = '# of Combinations')
+
+# weekly seasonality index
+model_data = model_data[order(store_id, prod_id, tran_dt)]
+
+# add wkly_volume, wkly_price, wkly_dct
+wkly_model_data = model_data[, 
+                             list(wkly_volume = sum(tran_prod_sale_qty),
+                                  wkly_price = sum(tran_prod_sale_amt)/sum(tran_prod_sale_qty),
+                                  wkly_dct = -sum(tran_prod_discount_amt)/sum(tran_prod_sale_qty)),
+                             by = c('store_id', 'prod_id', 'tran_wk', 'pre_target', 'tran_wk_hol', 'wk_index')]
+
+write.csv(wkly_model_data, 'wkly_model_data.csv', row.names = FALSE)
+```
+
+### Tables
+
+I need three tables to extract information from in order to build the functions and solve the problem
+1. The historical data of target products, complements and substitutes <- each row corresponds to each pre_target combinations
+2. For each target product, I have complement and substitute info. This data set is created with the other code file. 
+3. The most recent price of all the products; if price fluctuates between -20% and 20%, 2% at a time, find the best revenue
+
+Some assumptions:
+* In logit transformation of demand, the theoretical maximum volume is assumed to be 10% more than the maximum historical volume
+* The promotional details will be the same according to the corresponding period last year
+* It might not be appropriate to vary the price a lot. If the price is reduced to a large extent, this will even fall below cost, hurting profitability; if the price is increased to a larget degree, this will affect customers' price perception of the brand ('expensive'), which could damage its brand image. The idea is to search for the price within a range around its recent price. (low: 80%, high: 120%, step: 2%)
+
+*This chunk below works to create tables I need.*
+
+```{r}
+# 1)
+target = wkly_model_data[pre_target == 1]
+target[, unique_id := do.call(paste, c(.SD, sep = "_")), .SDcols = c('store_id', 'prod_id')]
+
+target[, max_wkly_volume := max(wkly_volume) * 1.1, by = .(store_id, prod_id)] # Assumption: 10% more than historical maximum
+target[, T_volume := log(wkly_volume/(max_wkly_volume - wkly_volume))]
+
+
+# 2)
+setwd("C:/Users/jczsh/Dropbox/Pernalonga")
+com_sub <- fread('dtList.csv')
+colnames(com_sub)[1:2] <- c('store_id', 'prod_id')
+com_sub[, unique_id := do.call(paste, c(.SD, sep = "_")), .SDcols = c('store_id', 'prod_id')]
+
+# put in just 1 complement and 1 substitute for now
+com_sub_price = merge(com_sub, wkly_model_data[, .(store_id, prod_id, tran_wk, wkly_price)], by.x = c('store_id', 'comp1'), by.y = c('store_id', 'prod_id'))
+setnames(com_sub_price, "wkly_price", "comp1_price")
+com_sub_price = merge(com_sub_price, wkly_model_data[, .(store_id, prod_id, tran_wk, wkly_price)], by.x = c('store_id', 'sub1', 'tran_wk'), by.y = c('store_id', 'prod_id', 'tran_wk'))
+setnames(com_sub_price, "wkly_price", "sub1_price")
+
+no_com_sub_id <- unique(com_sub[is.na(comp1)|is.na(sub1), unique_id])
+com_sub_id <- unique(com_sub[(!is.na(comp1))&(!is.na(sub1)), unique_id])
+
+target_part1 = merge(target[unique_id %in% com_sub_id], com_sub_price[, .(store_id, prod_id, tran_wk, comp1_price, sub1_price)], by = c('store_id', 'prod_id', 'tran_wk')) 
+target_part2 = target[unique_id %in% no_com_sub_id, list(store_id, prod_id, tran_wk, pre_target, tran_wk_hol, wk_index, wkly_volume, wkly_price, wkly_dct, unique_id, max_wkly_volume, T_volume, comp1_price = NA, sub1_price = NA)]
+target = rbind(target_part1, target_part2)
+
+# target # of obs drop by more than 50%
+
+com_sub_price[, max_wk_comp := max(tran_wk), by = .(store_id, comp1)]
+com_sub_price[, max_wk_sub := max(tran_wk), by = .(store_id, sub1)]
+
+recent_com_price = com_sub_price[tran_wk == max_wk_comp][, .(unique_id, comp1_price)]
+recent_sub_price = com_sub_price[tran_wk == max_wk_sub][, .(unique_id, sub1_price)]
+
+# 3)
+recent_tran_dt = model_data[, list(tran_dt = max(tran_dt)), by = .(store_id, prod_id)]
+recent = merge(model_data, recent_tran_dt, by = c('store_id', 'prod_id', 'tran_dt'))
+recent_price = recent[, list(prod_unit_price = min(prod_unit_price)), by = .(store_id, prod_id)]
+
+# add corresponding discount to recent price
+crp_dist = wkly_model_data[tran_wk == '201713', .(store_id, prod_id, wkly_price, wkly_dct)]
+crp_dist[, wkly_dct_ratio := wkly_dct/wkly_price]
+
+recent_price = merge(recent_price, crp_dist, all.x = TRUE, by = c('store_id', 'prod_id'))
+recent_price[is.na(wkly_dct_ratio), wkly_dct_ratio := 0]
+recent_price[is.na(wkly_dct), wkly_dct := 0]
+recent_price[, wkly_price := NULL]
+recent_price[, unique_id := do.call(paste, c(.SD, sep = "_")), .SDcols = c('store_id', 'prod_id')]
+recent_price_target = recent_price[unique_id %in% target$unique_id]
+
+# recent_price contains information for all: target products, complements and substitutes while recent_price_target only contains target products
+
+# create price range
+price_range = data.table(prod_unit_price = 1, suggested_price = 1)
+for (i in unique(recent_price_target$prod_unit_price)) {
+  for (j in seq(-0.2, 0.2, 0.02)){
+    price_range = rbind(price_range, list(i, round((1+j)*i, 2)))
+  }
+}
+
+price_range = price_range[2:dim(price_range)[1]]
+price_range = unique(price_range)
+
+price_range = merge(price_range, recent_price_target[, .(store_id, prod_id, prod_unit_price, wkly_dct_ratio, unique_id)], by = 'prod_unit_price', allow.cartesian = TRUE)
+
+price_range[, wkly_dct := suggested_price * wkly_dct_ratio] # same discount ratio as last year
+summary(price_range$wkly_dct) # no discounts in that period
+
+colnames(price_range)[2] <- 'wkly_price'
+price_range[, wk_index := 13] # '2018-04-01' to '2018-04-07' in week 13 of 2018
+price_range[, tran_wk_hol := 1] # with holiday: Easter
+price_range = merge(price_range, unique(target[, .(unique_id, max_wkly_volume)]), by = 'unique_id')
+price_range = merge(price_range, recent_com_price, by = 'unique_id', all.x = TRUE)
+price_range = merge(price_range, recent_sub_price, by = 'unique_id', all.x = TRUE)
+
+```
+
+
+## Run the model
+
+*The chunk below works to run the model and predict demand for different prices.*
+
+```{r}
+for (id in unique(target$unique_id)){
+  model <- target[unique_id == id]
+  if (id %in% no_com_sub_id) {
+    formula = T_volume ~ wkly_price + wkly_dct + wk_index + tran_wk_hol
+  } else {
+    formula = T_volume ~ wkly_price + wkly_dct + wk_index + tran_wk_hol + comp1_price + sub1_price
+  }
+  lm <- lm(formula, data = model)
+  price_range[unique_id == id, c('T_volume')] <- predict(lm, newdata = price_range[unique_id == id])
+}
+
+price_range[, est_volume := max_wkly_volume * exp(T_volume) / (exp(T_volume) + 1)] # refer to the formula
+price_range[, revenue := (wkly_price - wkly_dct) * est_volume]
+```
+
+
+***
+
+> Decision
+
+## Profitability
+
+To look for promising combinations with suggested prices, we need to first discard those that will cause loss.
+
+Some assumptions:
+* Grocery margins are typically less than 5%, assuming the cost of a product to be 95% of its lowest shelf price.
+
+*This chunk below works to calculate profit and keep the profitable combinations along with their suggested prices.*
+
+```{r}
+prod_cost = unique(model_data[, .(prod_id, prod_unit_price)])
+prod_cost = prod_cost[, list(est_cost = min(prod_unit_price) * 0.95), by = prod_id] # Grocery margins are typically less than 5%
+
+price_range = merge(price_range, prod_cost, by = 'prod_id')
+price_range[, profit := revenue - est_cost * est_volume]
+
+profit = price_range[profit > 0]
+```
+
+
+## Step by step selection
+
+1. Get the combinations with price specified that will bring positive incremntal revenue compared to their original price
+2. Restrict to 10 stores based on incremental revenue
+3. Restrict to 2 categories based on average incremental revenue of each product within that category
+4. Top 100 products from their incremental revenue
+
+*This chuck below conducts step-by-step filtering.*
+
+```{r}
+# maximize revenue to get the optimazed price
+profit[, max_rev := max(revenue), by = unique_id]
+
+# original estimated revenue
+org_rev = profit[prod_unit_price == wkly_price, .(unique_id, revenue)]
+colnames(org_rev)[2] <- 'org_rev'
+profit = merge(profit, org_rev, by = 'unique_id')
+
+# original price
+org_vol = profit[prod_unit_price == wkly_price, .(unique_id, est_volume)]
+colnames(org_vol)[2] <- 'org_vol'
+profit = merge(profit, org_vol, by = 'unique_id')
+profit[, incre_rev := max_rev - org_rev]
+
+final = profit[revenue == max_rev]
+
+# 1)
+final = final[incre_rev > 0] # price change is meaningful
+
+# 2) by store
+target_store = head(final[, list(sum_incre_rev = sum(incre_rev)), by = store_id][order(-sum_incre_rev), store_id], 10)
+final = final[store_id %in% target_store]
+
+# 3) by category
+category = prod[, .(prod_id, category_desc_eng)]
+final = merge(final, category, by = 'prod_id')
+target_categories = head(final[, list(sum_incre_rev = sum(incre_rev), num_of_prod = uniqueN(prod_id)), by = category_desc_eng][order(-sum_incre_rev/num_of_prod), category_desc_eng], 2)
+
+final = final[category_desc_eng %in% target_categories]
+
+# 4) by products
+target_product = head(final[, list(sum_incre_rev = sum(incre_rev)), by = prod_id][order(-sum_incre_rev), prod_id], 100)
+
+final = final[prod_id %in% target_product]
+```
+
+## Final results
+
+*This chunk works to get the final results.*
+
+```{r}
+final[, incre_prft := profit - (org_rev - org_vol * est_cost)]
+final = final[, .(store_id, prod_id, category_desc_eng, prod_unit_price, wkly_price, org_vol, est_volume, est_cost, org_rev, revenue, profit, incre_rev, incre_prft)]
+final
+colnames(final) <- c('store_id', 'prod_id', 'category', 'org_price', 'suggested_price', 'est_org_vol', 'est_vol', 'est_cost', 'est_org_rev', 'est_rev', 'est_prft', 'incre_rev', 'incre_prft')
+
+# weekly changes in quantity, revenue and profits  
+changes_sales_qty = final[, list(incre_qty = sum(est_vol) - sum(est_org_vol)), by = store_id][order(-incre_qty)]
+changes_rev = final[, list(incre_rev = sum(est_rev) - sum(est_org_rev)), by = store_id][order(-incre_rev)]
+changes_prft = final[, list(incre_prft = sum(incre_prft)), by = store_id][order(-incre_prft)]
+
+write.csv(final, 'final.csv', row.names = FALSE) # a list of 100 products with recommend price changes and justifications
+write.csv(changes_sales_qty, 'changes_sales_qty.csv', row.names = FALSE) # expected changes in sales quantity
+write.csv(changes_rev, 'changes_rev.csv', row.names = FALSE) # expected changes in revenue
+write.csv(changes_prft, 'changes_prft.csv', row.names = FALSE) # expected changes in profitability
+
+# across 10 stores
+sum(changes_sales_qty$incre_qty)
+sum(changes_rev$incre_rev)
+sum(changes_prft$incre_prft)
+```
+
